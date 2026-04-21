@@ -1,0 +1,174 @@
+name: 'UNPWNED Security Scan'
+description: 'Scan your website with 8 security checks. Detects missing headers, SSL issues, DNS misconfigs, cookie flaws, CORS bugs, exposed files, and breaches.'
+author: 'Raz Azulay'
+
+branding:
+  icon: 'shield'
+  color: 'green'
+
+inputs:
+  domain:
+    description: 'Domain or URL to scan (e.g. example.com or https://example.com)'
+    required: true
+  fail-on:
+    description: 'Fail the workflow if any finding at this severity or higher exists. Options: critical, high, medium, low, none'
+    required: false
+    default: 'critical'
+  comment-on-pr:
+    description: 'Post scan results as a comment on the pull request (requires pull-requests: write permission)'
+    required: false
+    default: 'false'
+
+outputs:
+  score:
+    description: 'Overall security score (0-100)'
+    value: ${{ steps.scan.outputs.score }}
+  grade:
+    description: 'Security grade (A+ to F)'
+    value: ${{ steps.scan.outputs.grade }}
+  critical:
+    description: 'Count of critical severity findings'
+    value: ${{ steps.scan.outputs.critical }}
+  high:
+    description: 'Count of high severity findings'
+    value: ${{ steps.scan.outputs.high }}
+  medium:
+    description: 'Count of medium severity findings'
+    value: ${{ steps.scan.outputs.medium }}
+  low:
+    description: 'Count of low severity findings'
+    value: ${{ steps.scan.outputs.low }}
+  report-path:
+    description: 'Path to the full JSON report artifact'
+    value: ${{ steps.scan.outputs.report-path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run UNPWNED scan
+      id: scan
+      shell: bash
+      run: |
+        set -e
+        DOMAIN="${{ inputs.domain }}"
+        REPORT_PATH="/tmp/unpwned-report.json"
+
+        echo "::group::Running UNPWNED scan on $DOMAIN"
+        npx -y unpwned@latest scan "$DOMAIN" --json --no-telemetry > "$REPORT_PATH"
+        echo "::endgroup::"
+
+        SCORE=$(jq -r '.overallScore' "$REPORT_PATH")
+        GRADE=$(jq -r '.grade' "$REPORT_PATH")
+        CRITICAL=$(jq '[.scanners[].findings[] | select(.severity == "critical")] | length' "$REPORT_PATH")
+        HIGH=$(jq '[.scanners[].findings[] | select(.severity == "high")] | length' "$REPORT_PATH")
+        MEDIUM=$(jq '[.scanners[].findings[] | select(.severity == "medium")] | length' "$REPORT_PATH")
+        LOW=$(jq '[.scanners[].findings[] | select(.severity == "low")] | length' "$REPORT_PATH")
+
+        {
+          echo "score=$SCORE"
+          echo "grade=$GRADE"
+          echo "critical=$CRITICAL"
+          echo "high=$HIGH"
+          echo "medium=$MEDIUM"
+          echo "low=$LOW"
+          echo "report-path=$REPORT_PATH"
+        } >> "$GITHUB_OUTPUT"
+
+        {
+          echo "## UNPWNED Security Scan"
+          echo ""
+          echo "**Target:** \`$DOMAIN\`"
+          echo "**Score:** $SCORE / 100 (Grade $GRADE)"
+          echo ""
+          echo "| Severity | Count |"
+          echo "|----------|-------|"
+          echo "| Critical | $CRITICAL |"
+          echo "| High     | $HIGH |"
+          echo "| Medium   | $MEDIUM |"
+          echo "| Low      | $LOW |"
+          echo ""
+          echo "Full report with AI fix prompts, PDF export, and continuous monitoring available at [unpwned.io](https://unpwned.io)."
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Comment on PR
+      if: ${{ inputs.comment-on-pr == 'true' && github.event_name == 'pull_request' }}
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs')
+          const report = JSON.parse(fs.readFileSync('/tmp/unpwned-report.json', 'utf8'))
+          const score = report.overallScore
+          const grade = report.grade
+          const counts = { critical: 0, high: 0, medium: 0, low: 0 }
+          for (const s of report.scanners) {
+            for (const f of s.findings) {
+              if (counts[f.severity] !== undefined) counts[f.severity]++
+            }
+          }
+          const emoji = score >= 80 ? '🟢' : score >= 50 ? '🟡' : '🔴'
+          const body = [
+            `## ${emoji} UNPWNED Security Scan`,
+            ``,
+            `**Target:** \`${report.target}\``,
+            `**Score:** ${score} / 100 (Grade ${grade})`,
+            ``,
+            `| Severity | Count |`,
+            `|----------|-------|`,
+            `| Critical | ${counts.critical} |`,
+            `| High     | ${counts.high} |`,
+            `| Medium   | ${counts.medium} |`,
+            `| Low      | ${counts.low} |`,
+            ``,
+            `[View full report with AI fix prompts at unpwned.io](https://unpwned.io)`,
+          ].join('\n')
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            body,
+          })
+
+    - name: Evaluate fail threshold
+      shell: bash
+      run: |
+        FAIL_ON="${{ inputs.fail-on }}"
+        CRITICAL=${{ steps.scan.outputs.critical }}
+        HIGH=${{ steps.scan.outputs.high }}
+        MEDIUM=${{ steps.scan.outputs.medium }}
+        LOW=${{ steps.scan.outputs.low }}
+
+        case "$FAIL_ON" in
+          critical)
+            if [ "$CRITICAL" -gt 0 ]; then
+              echo "::error::Found $CRITICAL critical issue(s). Failing workflow (fail-on=critical)."
+              exit 1
+            fi
+            ;;
+          high)
+            if [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+              echo "::error::Found critical or high severity issue(s). Failing workflow (fail-on=high)."
+              exit 1
+            fi
+            ;;
+          medium)
+            if [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ] || [ "$MEDIUM" -gt 0 ]; then
+              echo "::error::Found medium or higher severity issue(s). Failing workflow (fail-on=medium)."
+              exit 1
+            fi
+            ;;
+          low)
+            if [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ] || [ "$MEDIUM" -gt 0 ] || [ "$LOW" -gt 0 ]; then
+              echo "::error::Found issue(s) at or above low severity. Failing workflow (fail-on=low)."
+              exit 1
+            fi
+            ;;
+          none)
+            echo "Scan complete. Not failing on any severity (fail-on=none)."
+            ;;
+          *)
+            echo "::warning::Unknown fail-on value: $FAIL_ON. Treating as 'critical'."
+            if [ "$CRITICAL" -gt 0 ]; then exit 1; fi
+            ;;
+        esac
+
+        echo "Scan passed fail-on=$FAIL_ON threshold."

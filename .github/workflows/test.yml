@@ -1,0 +1,27 @@
+name: Test action
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run UNPWNED action against unpwned.io
+        id: scan
+        uses: ./
+        with:
+          domain: unpwned.io
+          fail-on: none
+
+      - name: Assert outputs are populated
+        run: |
+          echo "Score: ${{ steps.scan.outputs.score }}"
+          echo "Grade: ${{ steps.scan.outputs.grade }}"
+          test -n "${{ steps.scan.outputs.score }}"
+          test -n "${{ steps.scan.outputs.grade }}"
