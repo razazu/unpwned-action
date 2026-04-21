@@ -1,5 +1,5 @@
 name: 'UNPWNED Security Scan'
-description: 'Scan your website with 8 security checks. Detects missing headers, SSL issues, DNS misconfigs, cookie flaws, CORS bugs, exposed files, and breaches.'
+description: '8 security checks on every push. Headers, SSL, DNS, cookies, CORS, files, breaches. Fails builds on critical findings.'
 author: 'Raz Azulay'
 
 branding:
