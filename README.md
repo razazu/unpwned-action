@@ -132,6 +132,8 @@ jobs:
 
 Every PR gets an automatic comment with the current score and severity breakdown, so reviewers can spot regressions before approving.
 
+If the workflow token cannot write to pull requests, the action skips the comment with a warning and the scan result still decides the outcome. This happens when the `permissions` block is missing, and always for pull requests from forks.
+
 ### Use outputs in later steps
 
 ```yaml
@@ -283,7 +285,7 @@ cd unpwned-action
 # Push a branch, open a PR
 ```
 
-The self-test workflow (`.github/workflows/test.yml`) runs the action on Linux, macOS and Windows against local test targets (`test/targets.ts`): a healthy site, a site that blocks the scan, a site with a low score and a port that refuses connections. On pull requests it also posts the PR comments and checks what they say. It must pass before merging.
+The self-test workflow (`.github/workflows/test.yml`) runs the action on Linux, macOS and Windows against local test targets (`test/targets.ts`): a healthy site, a site that blocks the scan, a site with a low score and a port that refuses connections. On pull requests it also posts the PR comments and checks what they say, and runs once with a read-only token. It must pass before merging.
 
 ## License
 
