@@ -154,6 +154,42 @@ jobs:
           STARTED_AT: ${{ steps.clock.outputs.started-at }}
         run: bash test/check-comments.sh
 
+  pr-comment-read-only:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Start local test targets
+        run: bash test/start-targets.sh
+
+      - name: Comment with a token that cannot write to pull requests
+        id: scan
+        uses: ./
+        with:
+          domain: http://127.0.0.1:4601
+          fail-on: none
+          comment-on-pr: true
+
+      - name: Check that the scan still succeeded
+        env:
+          SCORE: ${{ steps.scan.outputs.score }}
+        run: |
+          set -euo pipefail
+          case "$SCORE" in
+            '' | *[!0-9]*)
+              echo "::error::The scan reported no score ('$SCORE')."
+              exit 1
+              ;;
+          esac
+          echo "ok: the scan succeeded without the comment, score $SCORE"
+
   released-tag:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     strategy:

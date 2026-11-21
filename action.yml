@@ -195,12 +195,19 @@ runs:
             ``,
             `[View full report with AI fix prompts at unpwned.io](https://unpwned.io)`,
           ].join('\n')
-          await github.rest.issues.createComment({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            issue_number: context.issue.number,
-            body,
-          })
+          try {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            })
+          } catch (error) {
+            if (error.status !== 403) throw error
+            core.warning(
+              'UNPWNED could not post the pull request comment because the workflow token cannot write to pull requests. Add "permissions: pull-requests: write" to the workflow. A pull request from a fork always gets a read-only token. The results are in the job summary.',
+            )
+          }
 
     - name: Evaluate fail threshold
       shell: bash
