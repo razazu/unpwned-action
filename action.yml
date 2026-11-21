@@ -63,7 +63,15 @@ runs:
       run: |
         set -euo pipefail
         REPORT_PATH="/tmp/unpwned-report.json"
+        if [ "${RUNNER_OS:-}" = "Windows" ]; then
+          REPORT_PATH="${RUNNER_TEMP//\\//}/unpwned-report.json"
+        fi
+        SCAN_LOG="$REPORT_PATH.log"
         DOMAIN_PATTERN='^[A-Za-z0-9][]A-Za-z0-9._~:/?#@!&=%+,[-]*$'
+
+        read_report() {
+          jq "$@" "$REPORT_PATH" | tr -d '\r'
+        }
 
         if [[ ! "$UNPWNED_DOMAIN" =~ $DOMAIN_PATTERN ]]; then
           echo "::error::The domain input must be a domain or URL made of URL characters only, starting with a letter or digit."
@@ -72,34 +80,36 @@ runs:
 
         echo "::group::Running UNPWNED scan on $UNPWNED_DOMAIN"
         set +e
-        npx -y unpwned@1 scan --json --no-telemetry -- "$UNPWNED_DOMAIN" > "$REPORT_PATH"
+        npx -y unpwned@1 scan --json --no-telemetry -- "$UNPWNED_DOMAIN" > "$REPORT_PATH" 2> "$SCAN_LOG"
         CLI_EXIT=$?
         set -e
+        cat "$SCAN_LOG"
         echo "::endgroup::"
 
         if ! jq -e '.scanners | type == "array"' "$REPORT_PATH" > /dev/null 2>&1; then
-          echo "::error::UNPWNED did not produce a report (exit code $CLI_EXIT). See the scan log above."
+          REASON=$(grep -m1 '^unpwned:' "$SCAN_LOG" | cut -c10- | tr -d '\r' | sed 's/%/%25/g' || true)
+          echo "::error::UNPWNED could not scan the target (exit code $CLI_EXIT). ${REASON:-See the scan log above.}"
           exit 1
         fi
 
-        SCORE=$(jq -r '.overallScore' "$REPORT_PATH")
-        GRADE=$(jq -r '.grade' "$REPORT_PATH")
-        CRITICAL=$(jq '[.scanners[].findings[] | select(.severity == "critical")] | length' "$REPORT_PATH")
-        HIGH=$(jq '[.scanners[].findings[] | select(.severity == "high")] | length' "$REPORT_PATH")
-        MEDIUM=$(jq '[.scanners[].findings[] | select(.severity == "medium")] | length' "$REPORT_PATH")
-        LOW=$(jq '[.scanners[].findings[] | select(.severity == "low")] | length' "$REPORT_PATH")
-        BLOCKED=$(jq -r 'if .interference then "true" else "false" end' "$REPORT_PATH")
-        BLOCK_REASON=$(jq -r '
+        SCORE=$(read_report -r '.overallScore')
+        GRADE=$(read_report -r '.grade')
+        CRITICAL=$(read_report '[.scanners[].findings[] | select(.severity == "critical")] | length')
+        HIGH=$(read_report '[.scanners[].findings[] | select(.severity == "high")] | length')
+        MEDIUM=$(read_report '[.scanners[].findings[] | select(.severity == "medium")] | length')
+        LOW=$(read_report '[.scanners[].findings[] | select(.severity == "low")] | length')
+        BLOCKED=$(read_report -r 'if .interference then "true" else "false" end')
+        BLOCK_REASON=$(read_report -r '
           if .interference then
             "HTTP \(.interference.status), "
             + (if .interference.provider then "\(.interference.provider) " else "" end)
             + (if .interference.reason == "challenge" then "challenge page"
                elif .interference.reason == "rate-limited" then "rate limit"
                else "block page" end)
-          else "" end' "$REPORT_PATH")
-        SKIPPED=$(jq -r '[.scanners[] | select(.skipped == true) | .name] | join(", ")' "$REPORT_PATH")
-        CHECKED=$(jq '[.scanners[] | select(.skipped != true)] | length' "$REPORT_PATH")
-        TOTAL=$(jq '.scanners | length' "$REPORT_PATH")
+          else "" end')
+        SKIPPED=$(read_report -r '[.scanners[] | select(.skipped == true and (.skipReason // "blocked") == "blocked") | .name] | join(", ")')
+        CHECKED=$(read_report '[.scanners[] | select(.skipped != true)] | length')
+        TOTAL=$(read_report '[.scanners[] | select((.skipReason // "") != "not-applicable")] | length')
 
         {
           echo "score=$SCORE"
@@ -139,11 +149,14 @@ runs:
 
     - name: Comment on PR
       if: ${{ inputs.comment-on-pr == 'true' && github.event_name == 'pull_request' }}
-      uses: actions/github-script@v7
+      uses: actions/github-script@v9
+      env:
+        UNPWNED_REPORT_PATH: ${{ steps.scan.outputs.report-path }}
+        UNPWNED_BLOCK_REASON: ${{ steps.scan.outputs.block-reason }}
       with:
         script: |
           const fs = require('fs')
-          const report = JSON.parse(fs.readFileSync('/tmp/unpwned-report.json', 'utf8'))
+          const report = JSON.parse(fs.readFileSync(process.env.UNPWNED_REPORT_PATH, 'utf8'))
           const score = report.overallScore
           const grade = report.grade
           const counts = { critical: 0, high: 0, medium: 0, low: 0 }
@@ -152,15 +165,19 @@ runs:
               if (counts[f.severity] !== undefined) counts[f.severity]++
             }
           }
-          const skipped = report.scanners.filter((s) => s.skipped).map((s) => s.name)
           const blocked = Boolean(report.interference)
+          const notChecked = report.scanners
+            .filter((s) => s.skipped && (s.skipReason ?? 'blocked') === 'blocked')
+            .map((s) => s.name)
+          const applicable = report.scanners.filter((s) => s.skipReason !== 'not-applicable').length
+          const checked = report.scanners.filter((s) => !s.skipped).length
           const emoji = blocked ? '⚠️' : score >= 80 ? '🟢' : score >= 50 ? '🟡' : '🔴'
           const scoreLines = blocked
             ? [
-                `**Partial score:** ${score} / 100 (${report.scanners.length - skipped.length} of ${report.scanners.length} checks)`,
+                `**Partial score:** ${score} / 100 (${checked} of ${applicable} checks)`,
                 ``,
-                `> **The target blocked this scan** (HTTP ${report.interference.status}).`,
-                `> Not checked: ${skipped.join(', ')}.`,
+                `> **The target blocked this scan** (${process.env.UNPWNED_BLOCK_REASON}).`,
+                `> Not checked: ${notChecked.join(', ')}.`,
               ]
             : [`**Score:** ${score} / 100 (Grade ${grade})`]
           const body = [

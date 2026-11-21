@@ -12,25 +12,23 @@ permissions:
 
 jobs:
   self-test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
 
       - name: Start local test targets
-        run: |
-          node test/targets.ts &
-          for attempt in $(seq 1 40); do
-            if curl -fsS -o /dev/null http://127.0.0.1:4601/; then
-              exit 0
-            fi
-            sleep 0.5
-          done
-          echo "::error::Test targets did not start."
-          exit 1
+        run: bash test/start-targets.sh
 
       - name: Healthy target with fail-on none
         id: healthy
@@ -38,6 +36,14 @@ jobs:
         with:
           domain: http://127.0.0.1:4601
           fail-on: none
+
+      - name: Upload the report named by the report-path output
+        uses: actions/upload-artifact@v7
+        with:
+          name: unpwned-report-${{ matrix.os }}
+          path: ${{ steps.healthy.outputs.report-path }}
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Blocked target fails by default
         id: blocked
@@ -77,6 +83,14 @@ jobs:
         with:
           domain: '--help'
 
+      - name: Target that refuses the connection
+        id: unreachable
+        continue-on-error: true
+        uses: ./
+        with:
+          domain: http://127.0.0.1:4609
+          fail-on: none
+
       - name: Check results
         env:
           HEALTHY_SCORE: ${{ steps.healthy.outputs.score }}
@@ -91,57 +105,89 @@ jobs:
           WEAK_SCORE: ${{ steps.weak.outputs.score }}
           WEAK_CRITICAL_OUTCOME: ${{ steps.weak-critical.outcome }}
           INVALID_OUTCOME: ${{ steps.invalid.outcome }}
-        run: |
-          set -euo pipefail
-          expect() {
-            if [ "$2" != "$3" ]; then
-              echo "::error::$1: expected '$3', got '$2'"
-              exit 1
-            fi
-            echo "ok: $1 = $2"
-          }
-          expect "healthy blocked flag" "$HEALTHY_BLOCKED" "false"
-          test -n "$HEALTHY_GRADE"
-          if [ "$HEALTHY_SCORE" -lt 50 ]; then
-            echo "::error::healthy target scored $HEALTHY_SCORE, expected 50 or more"
-            exit 1
-          fi
-          echo "ok: healthy score = $HEALTHY_SCORE"
-          expect "blocked outcome" "$BLOCKED_OUTCOME" "failure"
-          expect "blocked flag" "$BLOCKED_FLAG" "true"
-          expect "block reason" "$BLOCKED_REASON" "HTTP 403, Cloudflare challenge page"
-          expect "blocked but allowed outcome" "$ALLOWED_OUTCOME" "success"
-          expect "blocked but allowed flag" "$ALLOWED_FLAG" "true"
-          expect "low score outcome" "$WEAK_OUTCOME" "success"
-          if [ "$WEAK_SCORE" -ge 50 ]; then
-            echo "::error::weak target scored $WEAK_SCORE, expected below 50"
-            exit 1
-          fi
-          echo "ok: weak score = $WEAK_SCORE"
-          expect "critical finding outcome" "$WEAK_CRITICAL_OUTCOME" "failure"
-          expect "invalid domain outcome" "$INVALID_OUTCOME" "failure"
+          UNREACHABLE_OUTCOME: ${{ steps.unreachable.outcome }}
+        run: bash test/check-results.sh
 
-  released-tag:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+  pr-comment:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: pr-comment-${{ github.event.pull_request.number }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
 
       - name: Start local test targets
-        run: |
-          node test/targets.ts &
-          for attempt in $(seq 1 40); do
-            if curl -fsS -o /dev/null http://127.0.0.1:4601/; then
-              exit 0
-            fi
-            sleep 0.5
-          done
-          echo "::error::Test targets did not start."
-          exit 1
+        run: bash test/start-targets.sh
+
+      - name: Note the start time
+        id: clock
+        run: echo "started-at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Comment for a healthy target
+        uses: ./
+        with:
+          domain: http://127.0.0.1:4601
+          fail-on: none
+          comment-on-pr: true
+
+      - name: Comment for a blocked target
+        uses: ./
+        with:
+          domain: http://127.0.0.1:4602
+          fail-on: none
+          fail-on-blocked: 'false'
+          comment-on-pr: true
+
+      - name: Check and remove the test comments
+        if: ${{ always() && steps.clock.outputs.started-at != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          STARTED_AT: ${{ steps.clock.outputs.started-at }}
+        run: bash test/check-comments.sh
+
+  released-tag:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Start local test targets
+        run: bash test/start-targets.sh
+
+      - name: Healthy target through the v1 tag
+        id: healthy
+        uses: razazu/unpwned-action@v1
+        with:
+          domain: http://127.0.0.1:4601
+          fail-on: none
+
+      - name: Upload the report named by the report-path output
+        uses: actions/upload-artifact@v7
+        with:
+          name: unpwned-report-v1-${{ matrix.os }}
+          path: ${{ steps.healthy.outputs.report-path }}
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Blocked target through the v1 tag
         id: blocked
@@ -153,12 +199,24 @@ jobs:
 
       - name: Check that v1 runs the current release
         env:
+          HEALTHY_SCORE: ${{ steps.healthy.outputs.score }}
           BLOCKED_OUTCOME: ${{ steps.blocked.outcome }}
           BLOCKED_FLAG: ${{ steps.blocked.outputs.blocked }}
+          BLOCKED_REASON: ${{ steps.blocked.outputs.block-reason }}
         run: |
           set -euo pipefail
+          case "$HEALTHY_SCORE" in
+            '' | *[!0-9]*)
+              echo "::error::v1 reported no score for the healthy target ('$HEALTHY_SCORE')."
+              exit 1
+              ;;
+          esac
           if [ "$BLOCKED_OUTCOME" != "failure" ] || [ "$BLOCKED_FLAG" != "true" ]; then
             echo "::error::v1 does not report blocked scans (outcome '$BLOCKED_OUTCOME', blocked '$BLOCKED_FLAG')."
             exit 1
           fi
-          echo "ok: v1 reports blocked scans"
+          if [ "$BLOCKED_REASON" != "HTTP 403, Cloudflare challenge page" ]; then
+            echo "::error::v1 reported an unexpected block reason: '$BLOCKED_REASON'."
+            exit 1
+          fi
+          echo "ok: v1 scored the healthy target $HEALTHY_SCORE and reports blocked scans"
