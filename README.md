@@ -155,7 +155,7 @@ Every PR gets an automatic comment with the current score and severity breakdown
   with:
     domain: example.com
 
-- uses: actions/upload-artifact@v4
+- uses: actions/upload-artifact@v7
   with:
     name: unpwned-report
     path: ${{ steps.scan.outputs.report-path }}
@@ -235,16 +235,17 @@ Weighted average across all checks:
 
 ## Runner Compatibility
 
-The action is a composite action that uses `bash` and `jq`. It runs on:
+The action is a composite action that uses `bash` and `jq`. Its self-test workflow runs it on all three GitHub-hosted runner families on every change:
 
-- `ubuntu-latest` ✅ (recommended, fully supported)
-- `macos-latest` ✅ (`jq` available by default)
-- `windows-latest` ⚠️ (requires bash shell, use WSL or `shell: bash`)
+- `ubuntu-latest` ✅
+- `macos-latest` ✅
+- `windows-latest` ✅ (uses the Git Bash that ships with the runner)
 
 ## Requirements
 
-- GitHub-hosted runner or self-hosted runner with Node.js 18+ and `jq`
+- GitHub-hosted runner, or a self-hosted runner with Node.js 18+, `bash` and `jq`
 - Runs the latest 1.x release of the [`unpwned` CLI](https://www.npmjs.com/package/unpwned)
+- If the scanner cannot produce a report, the action fails and shows the scanner's error message
 - No authentication required
 - No secrets needed
 
@@ -282,7 +283,7 @@ cd unpwned-action
 # Push a branch, open a PR
 ```
 
-The self-test workflow (`.github/workflows/test.yml`) runs the action against local test targets (`test/targets.ts`): a healthy site, a site that blocks the scan, and a site with a low score. It must pass before merging.
+The self-test workflow (`.github/workflows/test.yml`) runs the action on Linux, macOS and Windows against local test targets (`test/targets.ts`): a healthy site, a site that blocks the scan, a site with a low score and a port that refuses connections. On pull requests it also posts the PR comments and checks what they say. It must pass before merging.
 
 ## License
 
