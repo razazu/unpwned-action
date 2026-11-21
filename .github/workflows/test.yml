@@ -12,7 +12,6 @@ permissions:
 
 jobs:
   self-test:
-    name: self-test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -156,7 +155,6 @@ jobs:
         run: bash test/check-comments.sh
 
   released-tag:
-    name: released-tag (${{ matrix.os }})
     if: ${{ github.event_name == 'workflow_dispatch' }}
     strategy:
       fail-fast: false
