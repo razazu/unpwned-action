@@ -14,6 +14,10 @@ inputs:
     description: 'Fail the workflow if any finding at this severity or higher exists. Options: critical, high, medium, low, none'
     required: false
     default: 'critical'
+  fail-on-blocked:
+    description: 'Fail the workflow when the target blocks the scan (WAF, rate limit or challenge page), because the result is then partial. Options: true, false'
+    required: false
+    default: 'true'
   comment-on-pr:
     description: 'Post scan results as a comment on the pull request (requires pull-requests: write permission)'
     required: false
@@ -38,6 +42,12 @@ outputs:
   low:
     description: 'Count of low severity findings'
     value: ${{ steps.scan.outputs.low }}
+  blocked:
+    description: 'true when the target blocked the scan and the result is partial, otherwise false'
+    value: ${{ steps.scan.outputs.blocked }}
+  block-reason:
+    description: 'Short description of the block, for example "HTTP 403, Cloudflare challenge page". Empty when the scan was not blocked'
+    value: ${{ steps.scan.outputs.block-reason }}
   report-path:
     description: 'Path to the full JSON report artifact'
     value: ${{ steps.scan.outputs.report-path }}
@@ -48,14 +58,29 @@ runs:
     - name: Run UNPWNED scan
       id: scan
       shell: bash
+      env:
+        UNPWNED_DOMAIN: ${{ inputs.domain }}
       run: |
-        set -e
-        DOMAIN="${{ inputs.domain }}"
+        set -euo pipefail
         REPORT_PATH="/tmp/unpwned-report.json"
+        DOMAIN_PATTERN='^[A-Za-z0-9][]A-Za-z0-9._~:/?#@!&=%+,[-]*$'
 
-        echo "::group::Running UNPWNED scan on $DOMAIN"
-        npx -y unpwned@latest scan "$DOMAIN" --json --no-telemetry > "$REPORT_PATH"
+        if [[ ! "$UNPWNED_DOMAIN" =~ $DOMAIN_PATTERN ]]; then
+          echo "::error::The domain input must be a domain or URL made of URL characters only, starting with a letter or digit."
+          exit 1
+        fi
+
+        echo "::group::Running UNPWNED scan on $UNPWNED_DOMAIN"
+        set +e
+        npx -y unpwned@1 scan --json --no-telemetry -- "$UNPWNED_DOMAIN" > "$REPORT_PATH"
+        CLI_EXIT=$?
+        set -e
         echo "::endgroup::"
+
+        if ! jq -e '.scanners | type == "array"' "$REPORT_PATH" > /dev/null 2>&1; then
+          echo "::error::UNPWNED did not produce a report (exit code $CLI_EXIT). See the scan log above."
+          exit 1
+        fi
 
         SCORE=$(jq -r '.overallScore' "$REPORT_PATH")
         GRADE=$(jq -r '.grade' "$REPORT_PATH")
@@ -63,6 +88,18 @@ runs:
         HIGH=$(jq '[.scanners[].findings[] | select(.severity == "high")] | length' "$REPORT_PATH")
         MEDIUM=$(jq '[.scanners[].findings[] | select(.severity == "medium")] | length' "$REPORT_PATH")
         LOW=$(jq '[.scanners[].findings[] | select(.severity == "low")] | length' "$REPORT_PATH")
+        BLOCKED=$(jq -r 'if .interference then "true" else "false" end' "$REPORT_PATH")
+        BLOCK_REASON=$(jq -r '
+          if .interference then
+            "HTTP \(.interference.status), "
+            + (if .interference.provider then "\(.interference.provider) " else "" end)
+            + (if .interference.reason == "challenge" then "challenge page"
+               elif .interference.reason == "rate-limited" then "rate limit"
+               else "block page" end)
+          else "" end' "$REPORT_PATH")
+        SKIPPED=$(jq -r '[.scanners[] | select(.skipped == true) | .name] | join(", ")' "$REPORT_PATH")
+        CHECKED=$(jq '[.scanners[] | select(.skipped != true)] | length' "$REPORT_PATH")
+        TOTAL=$(jq '.scanners | length' "$REPORT_PATH")
 
         {
           echo "score=$SCORE"
@@ -71,14 +108,24 @@ runs:
           echo "high=$HIGH"
           echo "medium=$MEDIUM"
           echo "low=$LOW"
+          echo "blocked=$BLOCKED"
+          echo "block-reason=$BLOCK_REASON"
           echo "report-path=$REPORT_PATH"
         } >> "$GITHUB_OUTPUT"
 
         {
           echo "## UNPWNED Security Scan"
           echo ""
-          echo "**Target:** \`$DOMAIN\`"
-          echo "**Score:** $SCORE / 100 (Grade $GRADE)"
+          echo "**Target:** \`$UNPWNED_DOMAIN\`"
+          if [ "$BLOCKED" = "true" ]; then
+            echo "**Partial score:** $SCORE / 100 ($CHECKED of $TOTAL checks)"
+            echo ""
+            echo "> **The target blocked this scan** ($BLOCK_REASON)."
+            echo "> Not checked: $SKIPPED."
+            echo "> Allow requests from your CI runners in your WAF to get a full scan."
+          else
+            echo "**Score:** $SCORE / 100 (Grade $GRADE)"
+          fi
           echo ""
           echo "| Severity | Count |"
           echo "|----------|-------|"
@@ -105,12 +152,22 @@ runs:
               if (counts[f.severity] !== undefined) counts[f.severity]++
             }
           }
-          const emoji = score >= 80 ? '🟢' : score >= 50 ? '🟡' : '🔴'
+          const skipped = report.scanners.filter((s) => s.skipped).map((s) => s.name)
+          const blocked = Boolean(report.interference)
+          const emoji = blocked ? '⚠️' : score >= 80 ? '🟢' : score >= 50 ? '🟡' : '🔴'
+          const scoreLines = blocked
+            ? [
+                `**Partial score:** ${score} / 100 (${report.scanners.length - skipped.length} of ${report.scanners.length} checks)`,
+                ``,
+                `> **The target blocked this scan** (HTTP ${report.interference.status}).`,
+                `> Not checked: ${skipped.join(', ')}.`,
+              ]
+            : [`**Score:** ${score} / 100 (Grade ${grade})`]
           const body = [
             `## ${emoji} UNPWNED Security Scan`,
             ``,
             `**Target:** \`${report.target}\``,
-            `**Score:** ${score} / 100 (Grade ${grade})`,
+            ...scoreLines,
             ``,
             `| Severity | Count |`,
             `|----------|-------|`,
@@ -130,12 +187,22 @@ runs:
 
     - name: Evaluate fail threshold
       shell: bash
+      env:
+        FAIL_ON: ${{ inputs.fail-on }}
+        FAIL_ON_BLOCKED: ${{ inputs.fail-on-blocked }}
+        BLOCKED: ${{ steps.scan.outputs.blocked }}
+        BLOCK_REASON: ${{ steps.scan.outputs.block-reason }}
+        CRITICAL: ${{ steps.scan.outputs.critical }}
+        HIGH: ${{ steps.scan.outputs.high }}
+        MEDIUM: ${{ steps.scan.outputs.medium }}
+        LOW: ${{ steps.scan.outputs.low }}
       run: |
-        FAIL_ON="${{ inputs.fail-on }}"
-        CRITICAL=${{ steps.scan.outputs.critical }}
-        HIGH=${{ steps.scan.outputs.high }}
-        MEDIUM=${{ steps.scan.outputs.medium }}
-        LOW=${{ steps.scan.outputs.low }}
+        set -euo pipefail
+
+        if [ "$BLOCKED" = "true" ] && [ "$FAIL_ON_BLOCKED" != "false" ]; then
+          echo "::error::The target blocked the scan ($BLOCK_REASON), so the result is partial. Allow your CI runners in your WAF, or set fail-on-blocked: false."
+          exit 1
+        fi
 
         case "$FAIL_ON" in
           critical)
@@ -166,9 +233,9 @@ runs:
             echo "Scan complete. Not failing on any severity (fail-on=none)."
             ;;
           *)
-            echo "::warning::Unknown fail-on value: $FAIL_ON. Treating as 'critical'."
+            echo "::warning::Unknown fail-on value. Treating it as 'critical'."
             if [ "$CRITICAL" -gt 0 ]; then exit 1; fi
             ;;
         esac
 
-        echo "Scan passed fail-on=$FAIL_ON threshold."
+        echo "Scan passed the fail-on threshold."

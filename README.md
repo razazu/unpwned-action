@@ -75,7 +75,7 @@ jobs:
           domain: yoursite.com
 ```
 
-On every push, the Actions tab shows a scan summary with score, grade, and a severity breakdown. By default, the workflow fails on **critical** findings.
+On every push, the Actions tab shows a scan summary with score, grade, and a severity breakdown. By default, the workflow fails on **critical** findings, and when the target blocks the scan.
 
 ## Inputs
 
@@ -83,6 +83,7 @@ On every push, the Actions tab shows a scan summary with score, grade, and a sev
 |:-----|:---------|:--------|:------------|
 | `domain` | yes | - | Domain or URL to scan (e.g. `example.com`) |
 | `fail-on` | no | `critical` | Fail workflow on: `critical`, `high`, `medium`, `low`, `none` |
+| `fail-on-blocked` | no | `true` | Fail workflow when the target blocks the scan, since the result is then partial |
 | `comment-on-pr` | no | `false` | Post results as a PR comment (needs `pull-requests: write`) |
 
 ## Outputs
@@ -95,6 +96,8 @@ On every push, the Actions tab shows a scan summary with score, grade, and a sev
 | `high` | Count of high severity findings |
 | `medium` | Count of medium severity findings |
 | `low` | Count of low severity findings |
+| `blocked` | `true` when the target blocked the scan and the result is partial, otherwise `false` |
+| `block-reason` | Short description of the block, e.g. `HTTP 403, Cloudflare challenge page`. Empty when not blocked |
 | `report-path` | Path to the full JSON report for downstream steps |
 
 ## Examples
@@ -176,6 +179,25 @@ jobs:
           fail-on: none
 ```
 
+## When the Target Blocks the Scan
+
+GitHub-hosted runners share IP ranges that many WAFs challenge or rate limit. When that happens, the scanner sees a block page, not your site.
+
+The action detects this and reports it instead of scoring the block page:
+
+- The summary shows a **partial score**, the reason (for example `HTTP 403, Cloudflare challenge page`) and which checks could not run.
+- The `blocked` output is `true`.
+- The workflow fails by default, so a scan that never reached your site cannot pass as green.
+
+To get a full scan, allow your CI runners in your WAF. To keep the workflow green anyway, turn the failure off:
+
+```yaml
+- uses: razazu/unpwned-action@v1
+  with:
+    domain: example.com
+    fail-on-blocked: false
+```
+
 ## Scoring
 
 Weighted average across all checks:
@@ -184,11 +206,12 @@ Weighted average across all checks:
 |:------|:-------|:----|
 | Security Headers | 25% | First line of defense against XSS, clickjacking, MIME sniffing |
 | SSL/TLS | 20% | Encryption in transit is non-negotiable |
-| DNS Security | 20% | Email spoofing protection (SPF/DMARC/DKIM) |
+| DNS Security | 15% | Email spoofing protection (SPF/DMARC/DKIM) |
 | Cookie Security | 10% | Session hijacking prevention |
 | CORS Policy | 10% | Cross-origin data theft protection |
 | Sensitive Files | 10% | Exposed configs and credentials |
-| Tech Stack | 5% | Informational (no score penalty) |
+| Data Breaches | 10% | Known breaches tied to the domain |
+| Tech Stack | 0% | Informational, not scored |
 
 ### Grades
 
@@ -221,6 +244,7 @@ The action is a composite action that uses `bash` and `jq`. It runs on:
 ## Requirements
 
 - GitHub-hosted runner or self-hosted runner with Node.js 18+ and `jq`
+- Runs the latest 1.x release of the [`unpwned` CLI](https://www.npmjs.com/package/unpwned)
 - No authentication required
 - No secrets needed
 
@@ -258,7 +282,7 @@ cd unpwned-action
 # Push a branch, open a PR
 ```
 
-The self-test workflow (`.github/workflows/test.yml`) runs the action against `unpwned.io` on every push and must pass before merging.
+The self-test workflow (`.github/workflows/test.yml`) runs the action against local test targets (`test/targets.ts`): a healthy site, a site that blocks the scan, and a site with a low score. It must pass before merging.
 
 ## License
 
