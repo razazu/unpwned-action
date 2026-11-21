@@ -1,0 +1,164 @@
+name: Test action
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Start local test targets
+        run: |
+          node test/targets.ts &
+          for attempt in $(seq 1 40); do
+            if curl -fsS -o /dev/null http://127.0.0.1:4601/; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::Test targets did not start."
+          exit 1
+
+      - name: Healthy target with fail-on none
+        id: healthy
+        uses: ./
+        with:
+          domain: http://127.0.0.1:4601
+          fail-on: none
+
+      - name: Blocked target fails by default
+        id: blocked
+        continue-on-error: true
+        uses: ./
+        with:
+          domain: http://127.0.0.1:4602
+          fail-on: none
+
+      - name: Blocked target with fail-on-blocked false
+        id: blocked-allowed
+        uses: ./
+        with:
+          domain: http://127.0.0.1:4602
+          fail-on: none
+          fail-on-blocked: 'false'
+
+      - name: Low score with fail-on none
+        id: weak
+        uses: ./
+        with:
+          domain: http://127.0.0.1:4603
+          fail-on: none
+
+      - name: Critical finding with fail-on critical
+        id: weak-critical
+        continue-on-error: true
+        uses: ./
+        with:
+          domain: http://127.0.0.1:4603
+          fail-on: critical
+
+      - name: Domain input that looks like an option
+        id: invalid
+        continue-on-error: true
+        uses: ./
+        with:
+          domain: '--help'
+
+      - name: Check results
+        env:
+          HEALTHY_SCORE: ${{ steps.healthy.outputs.score }}
+          HEALTHY_GRADE: ${{ steps.healthy.outputs.grade }}
+          HEALTHY_BLOCKED: ${{ steps.healthy.outputs.blocked }}
+          BLOCKED_OUTCOME: ${{ steps.blocked.outcome }}
+          BLOCKED_FLAG: ${{ steps.blocked.outputs.blocked }}
+          BLOCKED_REASON: ${{ steps.blocked.outputs.block-reason }}
+          ALLOWED_OUTCOME: ${{ steps.blocked-allowed.outcome }}
+          ALLOWED_FLAG: ${{ steps.blocked-allowed.outputs.blocked }}
+          WEAK_OUTCOME: ${{ steps.weak.outcome }}
+          WEAK_SCORE: ${{ steps.weak.outputs.score }}
+          WEAK_CRITICAL_OUTCOME: ${{ steps.weak-critical.outcome }}
+          INVALID_OUTCOME: ${{ steps.invalid.outcome }}
+        run: |
+          set -euo pipefail
+          expect() {
+            if [ "$2" != "$3" ]; then
+              echo "::error::$1: expected '$3', got '$2'"
+              exit 1
+            fi
+            echo "ok: $1 = $2"
+          }
+          expect "healthy blocked flag" "$HEALTHY_BLOCKED" "false"
+          test -n "$HEALTHY_GRADE"
+          if [ "$HEALTHY_SCORE" -lt 50 ]; then
+            echo "::error::healthy target scored $HEALTHY_SCORE, expected 50 or more"
+            exit 1
+          fi
+          echo "ok: healthy score = $HEALTHY_SCORE"
+          expect "blocked outcome" "$BLOCKED_OUTCOME" "failure"
+          expect "blocked flag" "$BLOCKED_FLAG" "true"
+          expect "block reason" "$BLOCKED_REASON" "HTTP 403, Cloudflare challenge page"
+          expect "blocked but allowed outcome" "$ALLOWED_OUTCOME" "success"
+          expect "blocked but allowed flag" "$ALLOWED_FLAG" "true"
+          expect "low score outcome" "$WEAK_OUTCOME" "success"
+          if [ "$WEAK_SCORE" -ge 50 ]; then
+            echo "::error::weak target scored $WEAK_SCORE, expected below 50"
+            exit 1
+          fi
+          echo "ok: weak score = $WEAK_SCORE"
+          expect "critical finding outcome" "$WEAK_CRITICAL_OUTCOME" "failure"
+          expect "invalid domain outcome" "$INVALID_OUTCOME" "failure"
+
+  released-tag:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Start local test targets
+        run: |
+          node test/targets.ts &
+          for attempt in $(seq 1 40); do
+            if curl -fsS -o /dev/null http://127.0.0.1:4601/; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::Test targets did not start."
+          exit 1
+
+      - name: Blocked target through the v1 tag
+        id: blocked
+        continue-on-error: true
+        uses: razazu/unpwned-action@v1
+        with:
+          domain: http://127.0.0.1:4602
+          fail-on: none
+
+      - name: Check that v1 runs the current release
+        env:
+          BLOCKED_OUTCOME: ${{ steps.blocked.outcome }}
+          BLOCKED_FLAG: ${{ steps.blocked.outputs.blocked }}
+        run: |
+          set -euo pipefail
+          if [ "$BLOCKED_OUTCOME" != "failure" ] || [ "$BLOCKED_FLAG" != "true" ]; then
+            echo "::error::v1 does not report blocked scans (outcome '$BLOCKED_OUTCOME', blocked '$BLOCKED_FLAG')."
+            exit 1
+          fi
+          echo "ok: v1 reports blocked scans"
